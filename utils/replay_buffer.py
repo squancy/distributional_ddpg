@@ -1,0 +1,134 @@
+import numpy as np
+
+
+class ReplayAlphaStratified:
+    """
+    Replay buffer partitioned into some number of bins of sub-buffers by alpha value.
+    Ensures all risk levels appear in every training batch.
+
+    Attributes:
+        batch_size (int): Batch size.
+        n_bins (int): Number of bins.
+        bin_size (int): Size of each bin (size of memory divided by the number of bins).
+        dtype (np.dtype): Data type of each bin.
+        states (list[np.array]): Per-bin states.
+        actions (list[np.array]): Per-bin actions.
+        next_states (list[np.array]): Per-bin next states.
+        rewards (list[np.array]): Per-bin rewards.
+        risks (list[np.array]): Per-bin risks (scaled Markowitz portfolio return).
+        alphas (list[np.array]): Per-bin alpha values.
+        terminals (list[np.array]): Per-bin booleans indicating whether an episode has ended.
+        pos (list[int]): First non-empty position in each bin.
+        full (list[bool]): List of booleans indicating whether each bin is full or not.
+        min_alpha (float = 0.05): Minimum alpha value.
+        max_alpha (float = 0.5): Maximum alpha value.
+    """
+
+    def __init__(
+        self,
+        memory_size: int,
+        batch_size: int,
+        n_bins: int = 10,
+        dtype: np.dtype = np.float32,
+        min_alpha: float = 0.05,
+        max_alpha: float = 0.5,
+    ):
+        self.batch_size = batch_size
+        self.n_bins = n_bins
+        self.bin_size = memory_size // n_bins
+        self.dtype = dtype
+        self.states = [None] * n_bins
+        self.actions = [None] * n_bins
+        self.next_states = [None] * n_bins
+        self.rewards = [np.empty(self.bin_size) for _ in range(n_bins)]
+        self.risks = [np.empty(self.bin_size) for _ in range(n_bins)]
+        self.alphas = [np.empty(self.bin_size) for _ in range(n_bins)]
+        self.terminals = [np.empty(self.bin_size, dtype=np.int8) for _ in range(n_bins)]
+        self.pos = [0] * n_bins
+        self.full = [False] * n_bins
+        self.min_alpha = min_alpha
+        self.max_alpha = max_alpha
+
+    def _bin(self, alpha: float) -> int:
+        """
+        Given alpha between `self.min_alpha` and `self.max_alpha`,
+        it calculates the index of the bin to be used.
+
+        Args:
+            alpha (float): Alpha value.
+
+        Returns:
+            int: Index of bin.
+        """
+        return min(int(alpha * self.n_bins), self.n_bins - 1)
+
+    def feed(self, experience: tuple):
+        """
+        Add the collected experience to the state.
+
+        Args:
+            experience (tuple): Tuple containing the state,
+                action, reward, risk, next state, alpha and done.
+        """
+        state, action, reward, risk, next_state, alpha, done = experience
+        b = self._bin(float(alpha))
+        p = self.pos[b]
+        if self.states[b] is None:
+            self.states[b] = np.empty((self.bin_size,) + state.shape, dtype=self.dtype)
+            self.actions[b] = np.empty((self.bin_size,) + action.shape, dtype=self.dtype)
+            self.next_states[b] = np.empty((self.bin_size,) + next_state.shape, dtype=self.dtype)
+        self.states[b][p] = state
+        self.actions[b][p] = action
+        self.rewards[b][p] = reward
+        self.risks[b][p] = risk
+        self.next_states[b][p] = next_state
+        self.alphas[b][p] = alpha
+        self.terminals[b][p] = done
+        self.pos[b] += 1
+        if self.pos[b] == self.bin_size:
+            self.full[b] = True
+            self.pos[b] = 0
+
+    def size(self) -> int:
+        """
+        Returns the size of the replay buffer.
+
+        Returns:
+            int: Size of replay buffer.
+        """
+        return sum(self.bin_size if self.full[b] else self.pos[b] for b in range(self.n_bins))
+
+    def sample(self):
+        """
+        Samples a batch of experiences from the replay buffer, evenly distributed
+        across bins as much as possible.
+
+        Returns:
+            list: Batch of experiences.
+        """
+        non_empty = [b for b in range(self.n_bins) if self.full[b] or self.pos[b] > 0]
+        n = len(non_empty)
+        base, rem = divmod(self.batch_size, n)
+        counts = [base + (1 if i < rem else 0) for i in range(n)]
+        s, a, r, rk, ns, al, t = [], [], [], [], [], [], []
+        for b, cnt in zip(non_empty, counts):
+            ub = self.bin_size if self.full[b] else self.pos[b]
+            # noqa: NPY002 — global legacy RNG kept on purpose for stream-
+            # equivalence with the reference implementation; do not modernize.
+            idx = np.random.randint(0, ub, size=cnt)  # noqa: NPY002
+            s.append(self.states[b][idx])
+            a.append(self.actions[b][idx])
+            r.append(self.rewards[b][idx])
+            rk.append(self.risks[b][idx])
+            ns.append(self.next_states[b][idx])
+            al.append(self.alphas[b][idx])
+            t.append(self.terminals[b][idx])
+        return [
+            np.concatenate(s),
+            np.concatenate(a),
+            np.concatenate(r),
+            np.concatenate(rk),
+            np.concatenate(ns),
+            np.concatenate(al),
+            np.concatenate(t),
+        ]

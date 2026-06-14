@@ -1,0 +1,5 @@
+pyproject.toml
+.pre-commit-config.yaml
+*.swp
+__pycache__/
+.ruff_cache
