@@ -1,13 +1,20 @@
-from typing import Any
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pandas as pd
 import torch
 
 from Environment.AlphaEnv import PortfolioEnv
-from src.distributional_ddpg_t_dist_film_v2 import DDPGAgent
 from utils.config import Config
+from utils.utils import MDD, sharpe
 from wrappers.wrappers import DeepRLWrapper, env_wrapper
+
+if TYPE_CHECKING:
+    # Imported only for type hints; importing it at runtime would create a cycle
+    # (the main module imports TestDistributionalDDPG from here).
+    from src.distributional_ddpg_t_dist_film_v2 import DDPGAgent
 
 
 class TestDistributionalDDPG:
@@ -55,7 +62,7 @@ class TestDistributionalDDPG:
         df.index = pd.to_datetime(df["date"] * 1e9)
         return df["portfolio_value"], df
 
-    def validate(self, agent: DDPGAgent, alphas: list) -> tuple:
+    def validate(self, agent: DDPGAgent, alphas: list = None) -> tuple:
         """
         Deterministic rollout on the held-out validation slice (df_val) at each
         alpha.
@@ -85,7 +92,7 @@ class TestDistributionalDDPG:
             accs.append(float(pv.iloc[-1] - 1.0))
         return float(np.mean(accs)), accs
 
-    def cvar(self, returns: torch.Tensor, level: float) -> float:
+    def cvar(self, returns: torch.Tensor, level: float = None) -> float:
         """
         Implements expected shortfall.
 
@@ -120,16 +127,16 @@ class TestDistributionalDDPG:
         pv = df["portfolio_value"]
         rets = df["rate_of_return"].values
         acc = float(pv.iloc[-1] - 1.0)
-        mdd = self.MDD(pv.values)
+        mdd = MDD(pv.values)
         return dict(
             acc=acc,
             mdd=mdd,
             cvar=self.cvar(rets),
-            sharpe=self.sharpe(rets),
+            sharpe=sharpe(rets),
             calmar=(acc / mdd if mdd > 1e-12 else float("nan")),
         )
 
-    def run_fixed_weights(env: PortfolioEnv, weights: np.array) -> pd.DataFrame:
+    def run_fixed_weights(self, env: PortfolioEnv, weights: np.array) -> pd.DataFrame:
         """
         Simulates a constant portfolio.
 
@@ -151,7 +158,7 @@ class TestDistributionalDDPG:
         df.index = pd.to_datetime(df["date"] * 1e9)
         return df
 
-    def _row(label: str, m: dict) -> str:
+    def _row(self, label: str, m: dict) -> str:
         """
         Constructs a string of metrics.
 

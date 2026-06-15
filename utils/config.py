@@ -69,7 +69,11 @@ class Config:
         self.task_fn_test = lambda: env_wrapper(
             df=df_test, steps=500, window_length=window, random_reset=False
         )
-        task = self.task_fn()
+        # Build the env once for network-dimension inference and expose it so the
+        # caller can reuse it (e.g. for n_assets) instead of constructing another.
+        # Each random_reset=True construction draws from the global RNG, so an
+        # extra throwaway env would shift the stream and break seeded reproduction.
+        self.task = task = self.task_fn()
 
         self.actor_network_fn = lambda: DeterministicActorNetCVaR(
             state_dim=task.state_dim,

@@ -422,7 +422,7 @@ config = Config(
     root=root,
     tag=tag,
 )
-task = config.task_fn()
+task = config.task  # reuse the env Config already built (avoids an extra RNG draw)
 agent = DDPGAgent(config)
 test_eval = TestDistributionalDDPG(
     window=window, df_val=df_val, n_assets=task.action_dim - 1, agent=agent, config=config
@@ -558,3 +558,5 @@ else:
 
     torch.save(agent.worker_network.state_dict(), trained_model_path)
     print(f"\nBest-on-validation model saved to: {trained_model_path}")
+
+test_eval.diagnostic()
