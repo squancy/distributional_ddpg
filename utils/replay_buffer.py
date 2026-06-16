@@ -132,3 +132,81 @@ class ReplayAlphaStratified:
             np.concatenate(al),
             np.concatenate(t),
         ]
+
+
+class ReplayMemory:
+    """
+    Simple fixed-capacity circular replay buffer.
+
+    Used by the fixed-alpha variant, where alpha is constant within a run, so
+    there is nothing to stratify over.
+
+    Attributes:
+        memory_size (int): Capacity of the buffer.
+        batch_size (int): Batch size drawn by `sample`.
+        dtype (np.dtype): Data type of states/actions/next_states.
+        states (np.array | None): Stored states (lazily allocated on first feed).
+        actions (np.array | None): Stored actions (lazily allocated).
+        next_states (np.array | None): Stored next states (lazily allocated).
+        rewards (np.array): Stored rewards.
+        terminals (np.array): Stored done flags.
+        pos (int): Next write position (wraps around).
+    """
+
+    def __init__(self, memory_size: int, batch_size: int, dtype: np.dtype = np.float32):
+        self.memory_size = memory_size
+        self.batch_size = batch_size
+        self.dtype = dtype
+        self.states = None  # lazy-allocated on first feed
+        self.actions = None
+        self.next_states = None
+        self.rewards = np.empty(memory_size)
+        self.terminals = np.empty(memory_size, dtype=np.int8)
+        self.pos = 0
+        self._size = 0
+
+    def feed(self, experience: tuple):
+        """
+        Add a single transition to the buffer, overwriting the oldest once full.
+
+        Args:
+            experience (tuple): (state, action, reward, next_state, done).
+        """
+        state, action, reward, next_state, done = experience
+        p = self.pos
+        if self.states is None:
+            self.states = np.empty((self.memory_size,) + state.shape, dtype=self.dtype)
+            self.actions = np.empty((self.memory_size,) + action.shape, dtype=self.dtype)
+            self.next_states = np.empty((self.memory_size,) + state.shape, dtype=self.dtype)
+        self.states[p] = state
+        self.actions[p] = action
+        self.rewards[p] = reward
+        self.next_states[p] = next_state
+        self.terminals[p] = done
+        self.pos = (p + 1) % self.memory_size
+        self._size = min(self._size + 1, self.memory_size)
+
+    def size(self) -> int:
+        """
+        Returns the number of transitions currently stored.
+
+        Returns:
+            int: Current buffer size.
+        """
+        return self._size
+
+    def sample(self) -> list:
+        """
+        Sample a uniform random batch of transitions.
+
+        Returns:
+            list: [states, actions, rewards, next_states, terminals].
+        """
+        idx = np.random.randint(0, self._size, size=self.batch_size)  # noqa: NPY002
+        return [
+            self.states[idx],
+            self.actions[idx],
+            self.rewards[idx],
+            self.next_states[idx],
+            self.terminals[idx],
+        ]

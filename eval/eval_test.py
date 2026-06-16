@@ -273,3 +273,75 @@ class TestDistributionalDDPG:
 
         self.frontier("TEST  (held-out, honest estimate)", self.config.task_fn_test)
         self.baselines("TEST", self.config.task_fn_test, _best_asset)
+
+
+class TestFixedDDPG:
+    """
+    Evaluation for the fixed-alpha variant.
+
+    A single model is trained at one fixed alpha, so there is no frontier to
+    sweep: just roll the deterministic policy out on the validation and test
+    slices and report accumulated return, max drawdown and Sharpe ratio.
+
+    Attributes:
+        agent (DDPGAgent): The trained fixed-alpha agent.
+        config (ConfigFixed): Configuration instance.
+    """
+
+    def __init__(self, agent: DDPGAgent, config: Any):
+        self.agent = agent
+        self.config = config
+
+    def test_algo(self, env: DeepRLWrapper, algo: DDPGAgent) -> tuple:
+        """
+        Deterministic rollout of the fixed-alpha policy on an environment.
+
+        Args:
+            env (DeepRLWrapper): Portfolio environment.
+            algo (DDPGAgent): Trained fixed-alpha agent.
+
+        Returns:
+            tuple: (portfolio_value series, full info dataframe).
+        """
+        state = env.reset()
+        done = False
+        while not done:
+            action = algo._step(state)
+            state, _, done, _ = env.step(action)
+        df = pd.DataFrame(env.unwrapped.infos)
+        df.index = pd.to_datetime(df["date"] * 1e9)
+        return df["portfolio_value"], df
+
+    def print_metrics(self, df: pd.DataFrame, label: str):
+        """
+        Print accumulated return, max drawdown and Sharpe ratio for one rollout.
+
+        Args:
+            df (pd.DataFrame): Info dataframe.
+            label (str): Heading for the printed block.
+        """
+        pv = df["portfolio_value"]
+        acc_ret = pv.iloc[-1] - 1.0
+        mdd_val = MDD(pv.values)
+        sr = sharpe(df["rate_of_return"].values)
+        print(f"\n{label}")
+        print(f"  Accumulated return : {acc_ret:.4%}")
+        print(f"  Max drawdown       : {mdd_val:.4%}")
+        print(f"  Sharpe ratio       : {sr:.4f}")
+
+    def evaluate(self):
+        """
+        Roll out the fixed-alpha policy on the validation and test slices and
+        print the metrics for each.
+        """
+        print("\n" + "=" * 60)
+        print("EVALUATION - validation set")
+        print("=" * 60)
+        _, df_vali = self.test_algo(self.config.task_fn_vali(), self.agent)
+        self.print_metrics(df_vali, "Validation set")
+
+        print("\n" + "=" * 60)
+        print("EVALUATION - test set")
+        print("=" * 60)
+        _, df_test_res = self.test_algo(self.config.task_fn_test(), self.agent)
+        self.print_metrics(df_test_res, "Test set")

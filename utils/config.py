@@ -8,7 +8,9 @@ from network.network import (
     DeterministicCriticNetCVaR,
     DisjointActorCriticNet,
 )
-from utils.replay_buffer import ReplayAlphaStratified
+from network.network_fixed import DeterministicActorNetCVaR as FixedActorNet
+from network.network_fixed import DeterministicCriticNetCVaR as FixedCriticNet
+from utils.replay_buffer import ReplayAlphaStratified, ReplayMemory
 from utils.utils import Logger, OrnsteinUhlenbeckProcess
 from wrappers.wrappers import env_wrapper
 
@@ -128,6 +130,75 @@ class Config:
         self.test_interval = 50
         self.test_repetitions = 1
         self.val_interval = 100  # validate + checkpoint-select every 100 episodes
+        self.episode_limit = 5000
+        self.save_interval = 500
+        self.logger = Logger(root + "/log", gym.logger)
+        self.tag = tag
+
+
+class ConfigFixed:
+    """
+    Container for all configs of the fixed-alpha variant.
+    """
+
+    def __init__(
+        self,
+        df_train: pd.DataFrame,
+        df_test: pd.DataFrame,
+        window: int,
+        root: str,
+        tag: str,
+    ):
+        self.task_fn = lambda: env_wrapper(df=df_train, steps=128, window_length=window)
+        self.task_fn_vali = lambda: env_wrapper(
+            df=df_train, steps=2000, window_length=window, random_reset=False
+        )
+        self.task_fn_test = lambda: env_wrapper(
+            df=df_test, steps=500, window_length=window, random_reset=False
+        )
+        # Build the env once for network-dimension inference and expose it so the
+        # caller can reuse it (avoids an extra random_reset draw from the RNG).
+        self.task = task = self.task_fn()
+
+        self.actor_network_fn = lambda: FixedActorNet(
+            state_dim=task.state_dim,
+            action_dim=task.action_dim,
+            task=task,
+            action_gate=None,
+            action_scale=1.0,
+            non_linear=F.relu,
+            batch_norm=False,
+        )
+        self.critic_network_fn = lambda: FixedCriticNet(
+            state_dim=task.state_dim,
+            action_dim=task.action_dim,
+            task=task,
+            non_linear=F.relu,
+            batch_norm=False,
+            gpu=False,
+        )
+        self.network_fn = lambda: DisjointActorCriticNet(
+            self.actor_network_fn, self.critic_network_fn
+        )
+        self.actor_optimizer_fn = lambda params: torch.optim.Adam(params, lr=1e-5)
+        self.critic_optimizer_fn = lambda params: torch.optim.Adam(
+            params, lr=1e-4, weight_decay=0.001
+        )
+        self.batch_size = 32
+        self.replay_fn = lambda: ReplayMemory(memory_size=int(1e6), batch_size=self.batch_size)
+        self.entropy_bonus = 0.01
+        self.random_process_fn = lambda: OrnsteinUhlenbeckProcess(
+            size=task.action_dim, theta=0.3, sigma=0.3, sigma_min=0.01, n_steps_annealing=10000
+        )
+
+        self.discount = 0.99
+        self.min_memory_size = 1000
+        self.max_steps = 1000000
+        self.max_episode_length = 3000
+        self.target_network_mix = 0.001
+        self.gradient_clip = 20
+        self.test_interval = 50
+        self.test_repetitions = 1
         self.episode_limit = 5000
         self.save_interval = 500
         self.logger = Logger(root + "/log", gym.logger)
