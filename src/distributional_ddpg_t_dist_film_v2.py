@@ -531,8 +531,12 @@ def run_episodes(agent: DDPGAgent) -> float:
 
 agent.task._plot = agent.task._plot2 = None
 
-trained_model_path = root + "/video/t_dist_ddpg_film_v2_win15_etf.pth"
-best_model_path = root + "/video/t_dist_ddpg_film_v2_win15_etf_best.pth"
+trained_model_path = (
+    root + f"/video/t_dist_ddpg_film_v2_win15_{int(config.sigma_scale * steps)}_etf.pth"
+)
+best_model_path = (
+    root + f"/video/t_dist_ddpg_film_v2_win15_{int(config.sigma_scale * steps)}_etf_best.pth"
+)
 
 if args.eval_only:
     if not os.path.exists(trained_model_path):
