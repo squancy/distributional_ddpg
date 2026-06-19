@@ -8,4 +8,7 @@ We propose the following improvements to the paper Wang, M., & Ku, H. (2022). *R
 # Setting up the project
 All of the code is intended to be run in the same environment as the original, so we recommend following the instructions in https://codeocean.com/capsule/0769244/tree/v1 and using the Dockerfile to set up a container.
 
-The main entry point is `src/`. It contains the files which can be used to reproduce our results. `video/` contains the pre-trained models, so it is not needed to retrain the models for reproduction.
+The main entry point is `src/`. It contains the files which can be used to reproduce our results. `video/` contains the pre-trained models, so it is not needed to retrain the models for reproduction. To reproduce the plots in `results/`, run the following code (after setting up the Docker environment):
+```
+docker run -w /code -v "$(pwd)/code:/code" -v "$(pwd)/data:/data" [name-of-container] python -u eval/compare.py
+```
