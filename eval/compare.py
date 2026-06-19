@@ -47,26 +47,15 @@ from wrappers.wrappers import DeepRLWrapper, env_wrapper
 
 logging.basicConfig(level=logging.WARNING)
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_ROOT = os.path.dirname(_HERE)
-
 DATA_PATH = "/data/poloniex_fc.hf"
 ALPHAS = [0.05, 0.15, 0.30, 0.50]
 CVAR_LEVEL = 0.05  # fixed tail fraction for realized-CVaR reporting
 TEST_STEPS = 500
 BASELINE_WINDOW = 15  # window for the alpha-independent fixed-weight baselines
 
-"""
-CHECKPOINT_DIRS = [
-    os.path.join(os.getcwd(), "video"),
-    os.path.join(_ROOT, "video"),
-    os.path.join(_HERE, "video"),
-]
-"""
-
 CHECKPOINT_DIR = os.path.join(os.getcwd(), "video")
 
-OUTPUT_DIR = "/results"
+OUTPUT_DIR = os.path.join(os.getcwd(), "results")
 
 # arch "A" = no alpha input, "B" = late-alpha injection, "F" = FiLM.
 # Fixed-alpha families: {alpha: (checkpoint_candidates, window, arch)}.
