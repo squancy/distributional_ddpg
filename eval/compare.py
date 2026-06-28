@@ -49,6 +49,12 @@ logging.basicConfig(level=logging.WARNING)
 
 DATA_PATH = "/data/poloniex_fc.hf"
 ALPHAS = [0.05, 0.15, 0.30, 0.50]
+# Dense grid for the alpha-sensitive sweep: a fine set of risk levels in
+# [0.05, 0.50] (step 0.025) that includes the four canonical alphas above and
+# adds 15 intermediate ones.  Only the FiLM models -- one network conditioned on
+# alpha -- can be queried at these off-grid levels; it traces the continuous
+# risk-return frontier the discretely-trained fixed/Normal models only sample.
+DENSE_ALPHAS = [round(float(a), 3) for a in np.linspace(0.05, 0.50, 19)]
 CVAR_LEVEL = 0.05  # fixed tail fraction for realized-CVaR reporting
 TEST_STEPS = 500
 BASELINE_WINDOW = 15  # window for the alpha-independent fixed-weight baselines
@@ -65,10 +71,10 @@ FIXED_FAMILIES = {
         "color": "tomato",
         "linestyle": "--",
         "alphas": {
-            0.05: (["t_dist_ddpg_fixed_alpha05_win15_etf.pth"], 15, "B"),
-            0.15: (["t_dist_ddpg_fixed_alpha15_win15_etf.pth"], 15, "B"),
+            0.05: (["t_dist_ddpg_fixed_alpha05_win5_etf.pth"], 5, "B"),
+            0.15: (["t_dist_ddpg_fixed_alpha15_win10_etf.pth"], 10, "B"),
             0.30: (["t_dist_ddpg_fixed_alpha30_win15_etf.pth"], 15, "B"),
-            0.50: (["t_dist_ddpg_fixed_alpha50_win15_etf.pth"], 15, "B"),
+            0.50: (["t_dist_ddpg_fixed_alpha50_win10_etf.pth"], 10, "B"),
         },
     },
     "normal": {
@@ -79,7 +85,7 @@ FIXED_FAMILIES = {
             0.05: (["distributional_ddpg_cvar_win10_05_etf.pth"], 5, "A"),
             0.15: (["distributional_ddpg_cvar_win10_15_etf.pth"], 10, "B"),
             0.30: (["distributional_ddpg_cvar_win10_301_etf.pth"], 15, "B"),
-            # NOTE: this checkpoint actually contains an `out` layer (Type B);
+            # NOTE: this checkpoint actually contains an `out` layer (Type B)
             # loading it as Type A would silently drop `out.*` and mis-evaluate.
             0.50: (["distributional_ddpg_cvar_win1050_etf.pth"], 10, "B"),
         },
@@ -612,17 +618,9 @@ def plot_value_curves(results: dict):
             label=f"all-cash  AR={results['cash']['AR']:+.1%}",
         )
 
-        ax.set_title(f"alpha = {alpha:.0%}", fontsize=13, fontweight="bold")
         ax.set_ylabel("Portfolio value (start = 1.0)")
         ax.legend(fontsize=7.0, loc="upper left")
         ax.tick_params(axis="x", rotation=30)
-
-    fig.suptitle(
-        "Test split: T-dist fixed-alpha vs FiLM alpha-sensitive vs Normal-DDPG vs baselines",
-        fontsize=15,
-        fontweight="bold",
-        y=1.0,
-    )
     plt.tight_layout()
     print("\nFigure 1 (portfolio-value curves):")
     save_fig(fig, "comparison_value_curves.png")
@@ -670,21 +668,233 @@ def plot_frontier(results: dict):
         r = results[key]
         ax.scatter([r["MDD"]], [r["AR"]], color=color, s=140, marker=marker, zorder=5, label=label)
 
-    ax.set_xlabel("Max drawdown  (lower = safer →)", fontsize=12)
-    ax.set_ylabel("Accumulated return  (↑ better)", fontsize=12)
-    ax.set_title(
-        "Risk-return frontier on the test split\n"
-        "up-and-to-the-left dominates; an alpha-sensitive net should trace a frontier "
-        "from conservative (low alpha) to aggressive (high alpha)",
-        fontsize=12,
-        fontweight="bold",
-    )
+    ax.set_xlabel("Max drawdown", fontsize=12)
+    ax.set_ylabel("Accumulated return", fontsize=12)
     ax.axhline(0.0, color="black", lw=0.5, alpha=0.4)
     ax.grid(True, alpha=0.25)
     ax.legend(fontsize=9, loc="best")
     plt.tight_layout()
     print("\nFigure 2 (risk-return frontier):")
     save_fig(fig, "comparison_frontier.png")
+    plt.close(fig)
+
+
+# Dense alpha sweep (alpha-sensitive models only)
+def _monotone_fraction(values: list[float], rising: bool = True) -> float:
+    """
+    Fraction of adjacent pairs that respect the expected ordering -- a quick
+    smoothness/monotonicity score for a metric swept over alpha.
+
+    Args:
+        values (list[float]): Metric values in alpha order.
+        rising (bool = True): Whether the metric is expected to rise with alpha.
+
+    Returns:
+        float: Fraction of adjacent pairs in the expected order (1.0 = monotone).
+    """
+    if len(values) < 2:
+        return float("nan")
+    ok = sum((b >= a - 1e-12) if rising else (b <= a + 1e-12) for a, b in zip(values, values[1:]))
+    return ok / (len(values) - 1)
+
+
+def evaluate_film_dense(df_test: pd.DataFrame, dense_results: dict):
+    """
+    Evaluate each alpha-sensitive FiLM model on the DENSE_ALPHAS grid (not just
+    the four canonical levels).
+
+    Stores, per (model_key, alpha), the usual metrics plus the time-averaged
+    portfolio allocation (`mean_w`) used by the allocation plot.
+
+    Args:
+        df_test (pd.DataFrame): Test dataframe.
+        dense_results (dict): Dictionary in which the results are saved, keyed by
+            (model_key, alpha).
+    """
+    print("\n" + "=" * 64)
+    print(
+        f"T-dist FiLM dense alpha sweep  -  {len(DENSE_ALPHAS)} levels in "
+        f"[{DENSE_ALPHAS[0]:.3f}, {DENSE_ALPHAS[-1]:.3f}]"
+    )
+    print("=" * 64)
+    for model in FILM_MODELS:
+        ckpt = find_checkpoint(model["checkpoints"])
+        if ckpt is None:
+            print(f"\n  {model['label']}  [SKIP] missing {model['checkpoints'][0]}")
+            for alpha in DENSE_ALPHAS:
+                dense_results[(model["key"], alpha)] = None
+            continue
+        print(f"\n  {model['label']}  ckpt={os.path.basename(ckpt)}")
+        agent, _ = build_agent(df_test, model["window"], ckpt, "F")
+        for alpha in DENSE_ALPHAS:
+            env = make_test_env(df_test, model["window"])
+            df = evaluate_policy(agent, env, float(alpha))
+            m = metrics(df)
+            wcols = [c for c in df.columns if c.startswith("weight_")]
+            dense_results[(model["key"], alpha)] = {
+                **m,
+                "mean_w": df[wcols].mean(),
+                "wcols": wcols,
+            }
+        rows = [dense_results[(model["key"], a)] for a in DENSE_ALPHAS]
+        print(
+            f"    monotone-rising fraction over alpha:  "
+            f"AR={_monotone_fraction([r['AR'] for r in rows], True):.0%}  "
+            f"MDD={_monotone_fraction([r['MDD'] for r in rows], True):.0%}  "
+            f"CVaR={_monotone_fraction([r['CVaR'] for r in rows], False):.0%}"
+        )
+
+
+def plot_dense_frontier(results: dict, dense_results: dict):
+    """
+    Continuous risk-return frontier traced by the alpha-sensitive net: each FiLM
+    model's dense (MDD, AR) points, connected and colour-graded by alpha, with
+    the four-point fixed-alpha / Normal models and the baselines overlaid as
+    reference markers.
+
+    Args:
+        results (dict): Canonical-alpha results (for the reference points).
+        dense_results (dict): Dense-alpha FiLM results.
+    """
+    fig, ax = plt.subplots(figsize=(12, 8))
+    norm = plt.Normalize(DENSE_ALPHAS[0], DENSE_ALPHAS[-1])
+    sc = None
+    for model in FILM_MODELS:
+        rows = [(a, dense_results.get((model["key"], a))) for a in DENSE_ALPHAS]
+        rows = [(a, r) for a, r in rows if r]
+        if not rows:
+            continue
+        alphas = [a for a, _ in rows]
+        xs = [r["MDD"] for _, r in rows]
+        ys = [r["AR"] for _, r in rows]
+        ax.plot(xs, ys, "-", color=model["color"], lw=1.2, alpha=0.5, zorder=2)
+        sc = ax.scatter(
+            xs,
+            ys,
+            c=alphas,
+            cmap="viridis",
+            norm=norm,
+            s=45,
+            zorder=3,
+            edgecolor=model["color"],
+            linewidth=1.0,
+        )
+        ax.annotate(
+            model["label"],
+            (xs[-1], ys[-1]),
+            fontsize=8,
+            color=model["color"],
+            xytext=(6, 0),
+            textcoords="offset points",
+            va="center",
+        )
+    if sc is not None:
+        fig.colorbar(sc, ax=ax).set_label("alpha (risk tolerance)", fontsize=11)
+
+    for family, spec in FIXED_FAMILIES.items():
+        present = [a for a in ALPHAS if results.get((family, a))]
+        if not present:
+            continue
+        xs = [results[(family, a)]["MDD"] for a in present]
+        ys = [results[(family, a)]["AR"] for a in present]
+        ax.scatter(
+            xs,
+            ys,
+            marker="s",
+            facecolor="none",
+            edgecolor=spec["color"],
+            s=90,
+            lw=1.6,
+            zorder=4,
+            label=spec["label"],
+        )
+
+    for key in ("equal", "cash", "best"):
+        label, color, marker = BASELINE_STYLE[key]
+        r = results[key]
+        ax.scatter([r["MDD"]], [r["AR"]], color=color, s=150, marker=marker, zorder=5, label=label)
+
+    ax.set_xlabel("Max drawdown", fontsize=12)
+    ax.set_ylabel("Accumulated return", fontsize=12)
+    ax.axhline(0.0, color="black", lw=0.5, alpha=0.4)
+    ax.grid(True, alpha=0.25)
+    ax.legend(fontsize=9, loc="best")
+    plt.tight_layout()
+    print("\nFigure 3 (continuous frontier, dense alpha):")
+    save_fig(fig, "comparison_dense_frontier.png")
+    plt.close(fig)
+
+
+def plot_metrics_vs_alpha(dense_results: dict):
+    """
+    Each metric (AR, MDD, CVaR@5%, Sharpe) as a function of alpha for every FiLM
+    model on the dense grid.
+
+    Args:
+        dense_results (dict): Dense-alpha FiLM results.
+    """
+    panels = [
+        ("AR", "Accumulated return", True),
+        ("MDD", "Max drawdown", True),
+        ("CVaR", "CVaR@5% (downside)", False),
+        ("SR", "Sharpe ratio", None),
+    ]
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    for ax, (mkey, mlabel, _) in zip(axes.flatten(), panels):
+        for model in FILM_MODELS:
+            rows = [(a, dense_results.get((model["key"], a))) for a in DENSE_ALPHAS]
+            rows = [(a, r) for a, r in rows if r]
+            if not rows:
+                continue
+            ax.plot(
+                [a for a, _ in rows],
+                [r[mkey] for _, r in rows],
+                "-o",
+                color=model["color"],
+                ms=3,
+                lw=1.5,
+                label=model["label"],
+            )
+        for a in ALPHAS:
+            ax.axvline(a, color="grey", lw=0.6, ls=":", alpha=0.6)
+        ax.set_xlabel("alpha (risk tolerance)")
+        ax.set_ylabel(mlabel)
+        ax.grid(True, alpha=0.25)
+        ax.legend(fontsize=8)
+    plt.tight_layout()
+    print("\nFigure 4 (metrics vs alpha):")
+    save_fig(fig, "comparison_metrics_vs_alpha.png")
+    plt.close(fig)
+
+
+def plot_allocation_vs_alpha(dense_results: dict):
+    """
+    Stacked-area of the time-averaged portfolio allocation vs alpha, one panel per
+    FiLM model.
+
+    Args:
+        dense_results (dict): Dense-alpha FiLM results.
+    """
+    fig, axes = plt.subplots(1, len(FILM_MODELS), figsize=(6 * len(FILM_MODELS), 6), squeeze=False)
+    for ax, model in zip(axes[0], FILM_MODELS):
+        rows = [(a, dense_results.get((model["key"], a))) for a in DENSE_ALPHAS]
+        rows = [(a, r) for a, r in rows if r]
+        if not rows:
+            ax.set_visible(False)
+            continue
+        alphas = [a for a, _ in rows]
+        wcols = rows[0][1]["wcols"]
+        weights = np.array([[r["mean_w"][c] for c in wcols] for _, r in rows])  # [n_alpha, n_asset]
+        labels = [c.replace("weight_", "") for c in wcols]
+        ax.stackplot(alphas, weights.T, labels=labels, alpha=0.85)
+        ax.set_xlim(alphas[0], alphas[-1])
+        ax.set_ylim(0, 1)
+        ax.set_xlabel("alpha (risk tolerance)")
+        ax.set_ylabel("time-averaged weight")
+        ax.legend(fontsize=7, loc="upper right", ncol=2)
+    plt.tight_layout()
+    print("\nFigure 5 (allocation vs alpha):")
+    save_fig(fig, "comparison_allocation_vs_alpha.png")
     plt.close(fig)
 
 
@@ -697,9 +907,15 @@ def main():
     evaluate_film_models(df_test, results)
     best_idx = run_baselines(df_test, results)
 
+    dense_results: dict = {}
+    evaluate_film_dense(df_test, dense_results)
+
     print_summary(results, best_idx)
     plot_value_curves(results)
     plot_frontier(results)
+    plot_dense_frontier(results, dense_results)
+    plot_metrics_vs_alpha(dense_results)
+    plot_allocation_vs_alpha(dense_results)
     print("\nDone.")
 
 

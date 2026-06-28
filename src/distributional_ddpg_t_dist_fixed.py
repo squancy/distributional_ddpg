@@ -168,7 +168,12 @@ class DDPGAgent(mp.Process):
                 # (non-collapsed) allocations early in training.
                 w = np.clip(action, 1e-8, 1.0)
                 ent_bonus = config.entropy_bonus * (-np.sum(w * np.log(w)))
-                self.replay.feed([state, action, reward + ent_bonus, next_state, int(done)])
+                # Change 5: genuine per-step Markowitz portfolio risk
+                # sqrt(w^T Sigma w) (env-computed, info['portfolio risk']),
+                # scaled to reward units.  This is the sigma SOURCE term that
+                # replaces the collapsing pure bootstrap (see _update).
+                risk = float(np.sqrt(max(info["portfolio risk"], 0.0))) * config.sigma_scale
+                self.replay.feed([state, action, reward + ent_bonus, risk, next_state, int(done)])
                 self.total_steps += 1
 
             steps_ep += 1
@@ -188,23 +193,32 @@ class DDPGAgent(mp.Process):
         Args:
             config (ConfigFixed): Container for all configurations.
         """
-        states, actions, rewards, next_states, terminals = self.replay.sample()
+        states, actions, rewards, risks, next_states, terminals = self.replay.sample()
         states = tensor(states)
         actions = tensor(actions)
         rewards = tensor(rewards).unsqueeze(-1)
+        risks = tensor(risks).unsqueeze(-1)
         mask = tensor(1 - terminals).unsqueeze(-1)
         next_states = tensor(next_states)
         alphas = self._alpha_batch  # constant alpha; broadcast the pre-built tensor
 
         # critic: W_2 loss between t(nu, mu_t, sigma_t) and t(nu, mu_p, sigma_p).
-        # Plain bootstrap target sigma_t = gamma * sigma_next.
         q_next = self.target_critic.predict(
             next_states, alphas, self.target_actor.predict(next_states, alphas)
         )
         mu = q_next[:, 0].unsqueeze(-1)
         sigma = q_next[:, 1].unsqueeze(-1)
         mu_t = (config.discount * mu * mask + rewards + self.error).detach()
-        sigma_t = (config.discount * sigma * mask + self.error).detach()
+
+        # Change 5: proper distributional variance bootstrap with a genuine risk
+        # source term, sigma_t = sqrt(sigma_step^2 + gamma^2 * sigma_next^2).
+        # The plain bootstrap sigma_t = gamma * sigma_next collapses to its only
+        # fixed point 0, so kappa * sigma -> 0 and the fixed-alpha CVaR objective
+        # degenerates to pure mu-maximisation (identical across alpha, and never
+        # conservative at small alpha).  risks = scaled sqrt(w^T Sigma w) is the
+        # per-step Markowitz risk; it is positively risk-correlated, so a small
+        # alpha (large kappa) is now genuinely penalised for holding risk.
+        sigma_t = torch.sqrt(risks**2 + (config.discount * sigma * mask) ** 2 + self.error).detach()
 
         q = self.critic.predict(states, alphas, actions)
         mu_p = q[:, 0].unsqueeze(-1) + self.error

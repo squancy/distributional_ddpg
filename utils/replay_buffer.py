@@ -149,6 +149,8 @@ class ReplayMemory:
         actions (np.array | None): Stored actions (lazily allocated).
         next_states (np.array | None): Stored next states (lazily allocated).
         rewards (np.array): Stored rewards.
+        risks (np.array): Stored per-step Markowitz portfolio return std
+            sqrt(w^T Sigma w), scaled to reward units (the sigma source term).
         terminals (np.array): Stored done flags.
         pos (int): Next write position (wraps around).
     """
@@ -161,6 +163,7 @@ class ReplayMemory:
         self.actions = None
         self.next_states = None
         self.rewards = np.empty(memory_size)
+        self.risks = np.empty(memory_size)
         self.terminals = np.empty(memory_size, dtype=np.int8)
         self.pos = 0
         self._size = 0
@@ -170,9 +173,9 @@ class ReplayMemory:
         Add a single transition to the buffer, overwriting the oldest once full.
 
         Args:
-            experience (tuple): (state, action, reward, next_state, done).
+            experience (tuple): (state, action, reward, risk, next_state, done).
         """
-        state, action, reward, next_state, done = experience
+        state, action, reward, risk, next_state, done = experience
         p = self.pos
         if self.states is None:
             self.states = np.empty((self.memory_size,) + state.shape, dtype=self.dtype)
@@ -181,6 +184,7 @@ class ReplayMemory:
         self.states[p] = state
         self.actions[p] = action
         self.rewards[p] = reward
+        self.risks[p] = risk
         self.next_states[p] = next_state
         self.terminals[p] = done
         self.pos = (p + 1) % self.memory_size
@@ -200,13 +204,14 @@ class ReplayMemory:
         Sample a uniform random batch of transitions.
 
         Returns:
-            list: [states, actions, rewards, next_states, terminals].
+            list: [states, actions, rewards, risks, next_states, terminals].
         """
         idx = np.random.randint(0, self._size, size=self.batch_size)  # noqa: NPY002
         return [
             self.states[idx],
             self.actions[idx],
             self.rewards[idx],
+            self.risks[idx],
             self.next_states[idx],
             self.terminals[idx],
         ]

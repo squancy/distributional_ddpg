@@ -187,6 +187,10 @@ class ConfigFixed:
         self.batch_size = 32
         self.replay_fn = lambda: ReplayMemory(memory_size=int(1e6), batch_size=self.batch_size)
         self.entropy_bonus = 0.01
+        # Change 5: scales the env's daily portfolio std sqrt(w^T Sigma w) into
+        # reward units (reward = log_return * 10000/steps, steps=128), so the
+        # sigma source term and mu live on the same scale.
+        self.sigma_scale = 1.0 * 10000.0 / 128
         self.random_process_fn = lambda: OrnsteinUhlenbeckProcess(
             size=task.action_dim, theta=0.3, sigma=0.3, sigma_min=0.01, n_steps_annealing=10000
         )
