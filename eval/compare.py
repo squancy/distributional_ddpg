@@ -40,6 +40,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from Environment.AlphaEnv import PortfolioEnv
+from eval import frontier  # leaf module: numpy/scipy only (Markowitz + t-CVaR optimizers)
 from network.network import DeterministicActorNetCVaR as FilmActor
 from network.network_fixed import DeterministicActorNetCVaR as LateAlphaActor
 from utils.utils import MDD, sharpe
@@ -58,6 +59,15 @@ DENSE_ALPHAS = [round(float(a), 3) for a in np.linspace(0.05, 0.50, 19)]
 CVAR_LEVEL = 0.05  # fixed tail fraction for realized-CVaR reporting
 TEST_STEPS = 500
 BASELINE_WINDOW = 15  # window for the alpha-independent fixed-weight baselines
+
+# --- classical-benchmark / efficient-frontier settings (added) --------------
+# Causal covariance windows for the rolling Markowitz / t-CVaR benchmarks:
+# L=15 is *matched* to the RL state window (the fairest apples-to-apples), and
+# L=60 is a best-practice, better-conditioned estimate (disclosed as such).
+MV_LOOKBACK_MATCHED = 15
+MV_LOOKBACK_BEST = 60
+SHRINKAGE = "lw"  # Ledoit-Wolf shrinkage for frontier/benchmark Sigma
+_NU_CACHE: dict = {}
 
 CHECKPOINT_DIR = os.path.join(os.getcwd(), "video")
 
@@ -898,9 +908,563 @@ def plot_allocation_vs_alpha(dense_results: dict):
     plt.close(fig)
 
 
+def _nu_hat() -> float:
+    """
+    Estimate nu for the Student-t distribution using historical data.
+
+    Returns:
+        float: Estimated nu.
+    """
+    if "nu" not in _NU_CACHE:
+        from utils.utils import estimate_t_dof
+
+        repo_data = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data"))
+        for d in ("/data", repo_data):
+            try:
+                _NU_CACHE["nu"] = float(estimate_t_dof(data_dir=d, train_fraction=0.8))
+                break
+            except (FileNotFoundError, ValueError):
+                continue
+        if "nu" not in _NU_CACHE:
+            raise FileNotFoundError(
+                "could not locate ETF CSVs to estimate nu (need /data or ./data)"
+            )
+    return _NU_CACHE["nu"]
+
+
+def realized_sigma_mu(df: pd.DataFrame) -> tuple[float, float]:
+    """
+    Per-step realized volatility and mean of a rollout's net returns.
+
+    Args:
+        df (pd.DataFrame): Rollout dataframe with a `rate_of_return` column.
+
+    Returns:
+        tuple[float, float]: (realized_vol, realized_mean).
+    """
+    r = df["rate_of_return"].values
+    return float(np.std(r)), float(np.mean(r))
+
+
+def evaluate_dynamic_weights(env: PortfolioEnv, weight_fn) -> pd.DataFrame:
+    """
+    Roll out a time-varying weight policy on `env`. This is causal.
+
+    Args:
+        env (PortfolioEnv): Portfolio environment.
+        weight_fn (callable): `(src, state) -> weights`.
+
+    Returns:
+        pd.DataFrame: Rollout info dataframe.
+    """
+    state = env.reset()
+    done = False
+    while not done:
+        src = env.unwrapped.src
+        weights = np.asarray(weight_fn(src, state), dtype=np.float32)
+        state, _, done, _ = env.step(weights)
+    return _info_df(env)
+
+
+def _rolling_weight_fn(
+    kind: str,
+    lookback: int,
+    nu: float | None = None,
+    alpha: float | None = None,
+    relative: bool = False,
+):
+    """
+    Build a causal `weight_fn` for `evaluate_dynamic_weights` that re-estimates
+    mu, Sigma on the trailing `lookback` closes each step and solves the chosen
+    classical optimizer.
+
+    Args:
+        kind (str): One of "tangency", "gmv", "tcvar".
+        lookback (int): Trailing covariance window length.
+        nu (float | None): Student-t dof (for "tcvar").
+        alpha (float | None): CVaR level (for "tcvar").
+        relative (bool): Use the actor-matched relative tilt (for "tcvar").
+
+    Returns:
+        callable: `(src, state) -> full weight vector`.
+    """
+
+    def fn(src, state) -> np.ndarray:
+        end = src.step + src.window_length  # realising close is at index `end`
+        start = max(0, end - lookback)
+        closes = src.data[:, start:end, 3]  # (n_risky, <=lookback), all < realising close
+        n = closes.shape[0]
+        cash_only = np.array([1.0] + [0.0] * n)
+        if closes.shape[1] < 3:  # not enough history yet -> stay in cash
+            return cash_only
+        mu, sigma = frontier.estimate_mu_sigma(closes, shrinkage=SHRINKAGE)
+        if kind == "tcvar":
+            return frontier.t_cvar_weights(mu, sigma, alpha, nu, relative=relative)
+        if kind == "gmv":
+            return np.concatenate([[0.0], frontier.min_variance_portfolio(sigma)])
+        if kind == "tangency":
+            w = frontier.tangency_portfolio(mu, sigma, rf=0.0)
+            return cash_only if w is None else np.concatenate([[0.0], w])
+        raise ValueError(f"unknown kind {kind!r}")
+
+    return fn
+
+
+def _close_matrix(df: pd.DataFrame) -> np.ndarray:
+    """
+    Close-price matrix (n_assets, T) from a MultiIndex (asset, feature) frame,
+    in the env's asset order.
+
+    Args:
+        df (pd.DataFrame): OHLCV frame.
+
+    Returns:
+        np.ndarray: Close prices of shape (n_assets, T).
+    """
+    return df.xs("Close", axis=1, level=1).values.T
+
+
+def _score(df: pd.DataFrame, info_set: str, label: str, **extra) -> dict:
+    """
+    Package a rollout into a benchmark record: realized (sigma, mu), metrics, and
+    disclosure fields.
+
+    Args:
+        df (pd.DataFrame): Rollout dataframe.
+        info_set (str): "causal", "trained", or "oracle".
+        label (str): Human-readable label.
+        **extra: Extra fields (e.g. protocol disclosure).
+
+    Returns:
+        dict: Benchmark record.
+    """
+    s, m_ = realized_sigma_mu(df)
+    rec = {"df": df, "info_set": info_set, "label": label, "sigma": s, "mret": m_}
+    rec.update(metrics(df))
+    rec.update(extra)
+    return rec
+
+
+def run_classical_benchmarks(df_test: pd.DataFrame, df_train: pd.DataFrame, bench: dict) -> dict:
+    """
+    Evaluate the Markowitz and parametric-t mean-CVaR benchmarks in each
+    information set (causal / trained-once / oracle), all scored through the same
+    env and cost model as the RL policies.
+
+    Args:
+        df_test (pd.DataFrame): Test frame.
+        df_train (pd.DataFrame): Training frame (for the trained-once benchmark).
+        bench (dict): Dictionary in which the benchmark records are saved.
+
+    Returns:
+        dict: `bench`, populated. Also stores the oracle/trained frontier curves
+            under bench["_frontier_oracle"], bench["_frontier_trained"].
+    """
+    nu = _nu_hat()
+    win = BASELINE_WINDOW
+    print("\n" + "=" * 64)
+    print(f"Classical benchmarks (nu={nu:.2f}, shrinkage={SHRINKAGE!r})")
+    print("=" * 64)
+
+    # static estimates: oracle (look-ahead) & trained-once
+    mu_or, sig_or = frontier.estimate_mu_sigma(_close_matrix(df_test), shrinkage=SHRINKAGE)
+    mu_tr, sig_tr = frontier.estimate_mu_sigma(_close_matrix(df_train), shrinkage=SHRINKAGE)
+    bench["_frontier_oracle"] = {
+        "curve": frontier.markowitz_frontier(mu_or, sig_or),
+        "cml": frontier.capital_market_line(mu_or, sig_or, rf=0.0),
+    }
+    bench["_frontier_trained"] = {
+        "curve": frontier.markowitz_frontier(mu_tr, sig_tr),
+        "cml": frontier.capital_market_line(mu_tr, sig_tr, rf=0.0),
+    }
+
+    def _fixed(mu, sig, kind, n):
+        cash = np.array([1.0] + [0.0] * n)
+        if kind == "gmv":
+            return np.concatenate([[0.0], frontier.min_variance_portfolio(sig)])
+        w = frontier.tangency_portfolio(mu, sig, rf=0.0)
+        return cash if w is None else np.concatenate([[0.0], w])
+
+    n_assets = len(df_test.columns.levels[0])
+
+    # Oracle & trained static Markowitz points (tangency, GMV).
+    for tag, mu, sig, iset in (
+        ("oracle", mu_or, sig_or, "oracle"),
+        ("trained", mu_tr, sig_tr, "trained"),
+    ):
+        for kind, name in (("tangency", "Markowitz tangency"), ("gmv", "Markowitz GMV")):
+            w = _fixed(mu, sig, kind, n_assets)
+            df = evaluate_fixed_weights(make_test_env(df_test, win), w)
+            suffix = " (oracle, look-ahead)" if iset == "oracle" else " (trained-once)"
+            bench[f"mv_{kind}_{tag}"] = _score(
+                df, iset, name + suffix, estimator=f"whole-{tag} mu,Sigma"
+            )
+            print(
+                f"  {name + suffix:<40} AR={bench[f'mv_{kind}_{tag}']['AR']:+.2%}  "
+                f"MDD={bench[f'mv_{kind}_{tag}']['MDD']:.2%}"
+            )
+
+    # Oracle & trained static t-CVaR@alpha families (relative + absolute).
+    for tag, mu, sig, iset in (
+        ("oracle", mu_or, sig_or, "oracle"),
+        ("trained", mu_tr, sig_tr, "trained"),
+    ):
+        for rel in (True, False):
+            fam = frontier.t_cvar_family(mu, sig, nu, ALPHAS, relative=rel)
+            vlab = "rel" if rel else "abs"
+            for alpha, w in fam.items():
+                df = evaluate_fixed_weights(make_test_env(df_test, win), w)
+                lab = f"t-CVaR@a {'(rel)' if rel else '(abs)'} {tag}"
+                bench[(f"tcvar_{tag}_{vlab}", alpha)] = _score(df, iset, lab, alpha=alpha)
+
+    # causal rolling Markowitz
+    for L, ltag in ((MV_LOOKBACK_MATCHED, "L15"), (MV_LOOKBACK_BEST, "L60")):
+        for kind, name in (("tangency", "Markowitz tangency"), ("gmv", "Markowitz GMV")):
+            df = evaluate_dynamic_weights(make_test_env(df_test, win), _rolling_weight_fn(kind, L))
+            key = f"mv_{kind}_causal{ltag}"
+            bench[key] = _score(df, "causal", f"{name} (causal, {ltag})", estimator=f"trailing-{L}")
+            print(
+                f"  {name + f' (causal {ltag})':<40} AR={bench[key]['AR']:+.2%}  "
+                f"MDD={bench[key]['MDD']:.2%}"
+            )
+
+    # causal rolling t-CVaR@alpha
+    for alpha in ALPHAS:
+        df = evaluate_dynamic_weights(
+            make_test_env(df_test, win),
+            _rolling_weight_fn("tcvar", MV_LOOKBACK_MATCHED, nu=nu, alpha=alpha, relative=True),
+        )
+        bench[("tcvar_causalL15_rel", alpha)] = _score(
+            df, "causal", "t-CVaR@a (rel, causal L15)", alpha=alpha, estimator="trailing-15"
+        )
+        m = bench[("tcvar_causalL15_rel", alpha)]
+        print(
+            f"  t-CVaR causal a={alpha:.0%}  AR={m['AR']:+.2%}  MDD={m['MDD']:.2%}  "
+            f"CVaR={m['CVaR']:+.3%}"
+        )
+
+    return bench
+
+
+def plot_mv_overlay(results: dict, bench: dict):
+    """
+    Two-panel frontier overlay:
+      left: per-step (sigma, mu) space with the Markowitz efficient frontier
+            curve, Capital Market Line and oracle vs trained.
+            RL FiLM points, classical benchmark points, and the
+            1/N / cash / best baselines.
+      right: (MDD, AR) space with benchmarks overlaid.
+
+    Args:
+        results (dict): Canonical-alpha RL + baseline results (each has a "df").
+        bench (dict): Classical benchmark records from run_classical_benchmarks.
+    """
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=(18, 8))
+    norm = plt.Normalize(ALPHAS[0], ALPHAS[-1])
+
+    # left: efficient frontier + CML in (sigma, mu)
+    fo = bench.get("_frontier_oracle", {})
+    if fo.get("curve") is not None and len(fo["curve"]["vol"]):
+        c = fo["curve"]
+        axL.plot(
+            c["vol"],
+            c["ret"],
+            "-",
+            color="black",
+            lw=1.5,
+            alpha=0.6,
+            label="Markowitz frontier (oracle, look-ahead)",
+        )
+        cml = fo.get("cml")
+        if cml is not None:
+            xmax = max(c["vol"].max(), 1e-6)
+            axL.plot(
+                [0, xmax],
+                [0, cml["slope"] * xmax],
+                "--",
+                color="black",
+                lw=1.2,
+                alpha=0.6,
+                label="Capital Market Line (oracle)",
+            )
+            axL.scatter(
+                [cml["sigma_tan"]], [cml["mu_tan"]], marker="*", s=180, color="black", zorder=6
+            )
+    ft = bench.get("_frontier_trained", {})
+    if ft.get("curve") is not None and len(ft["curve"]["vol"]):
+        c = ft["curve"]
+        axL.plot(
+            c["vol"],
+            c["ret"],
+            ":",
+            color="dimgrey",
+            lw=1.3,
+            alpha=0.7,
+            label="Markowitz frontier (trained-once)",
+        )
+
+    sc = None
+    for model in FILM_MODELS:
+        pts = [(a, results.get((model["key"], a))) for a in ALPHAS]
+        pts = [(a, r) for a, r in pts if r]
+        if not pts:
+            continue
+        xs = [realized_sigma_mu(r["df"])[0] for _, r in pts]
+        ys = [realized_sigma_mu(r["df"])[1] for _, r in pts]
+        axL.plot(xs, ys, "-", color=model["color"], lw=1.0, alpha=0.5, zorder=3)
+        sc = axL.scatter(
+            xs,
+            ys,
+            c=[a for a, _ in pts],
+            cmap="viridis",
+            norm=norm,
+            s=55,
+            zorder=4,
+            edgecolor=model["color"],
+            linewidth=1.0,
+            label=model["label"],
+        )
+    # causal t-CVaR benchmark points
+    tcv = [(a, bench.get(("tcvar_causalL15_rel", a))) for a in ALPHAS]
+    tcv = [(a, r) for a, r in tcv if r]
+    if tcv:
+        axL.scatter(
+            [r["sigma"] for _, r in tcv],
+            [r["mret"] for _, r in tcv],
+            marker="D",
+            facecolor="none",
+            edgecolor="crimson",
+            s=70,
+            lw=1.6,
+            zorder=5,
+            label="t-CVaR@a (causal L15, fair)",
+        )
+    for key, style in (
+        ("mv_tangency_causalL15", ("^", "purple", "MV tangency (causal L15)")),
+        ("mv_tangency_oracle", ("^", "black", "MV tangency (oracle)")),
+    ):
+        r = bench.get(key)
+        if r:
+            axL.scatter(
+                [r["sigma"]],
+                [r["mret"]],
+                marker=style[0],
+                color=style[1],
+                s=90,
+                zorder=6,
+                label=style[2],
+            )
+    for key in ("equal", "cash", "best"):
+        if key in results:
+            label, color, marker = BASELINE_STYLE[key]
+            s, m_ = realized_sigma_mu(results[key]["df"])
+            axL.scatter([s], [m_], color=color, s=130, marker=marker, zorder=5, label=label)
+    if sc is not None:
+        fig.colorbar(sc, ax=axL).set_label("alpha (risk tolerance)")
+    axL.set_xlabel("Per-step realized volatility  std(return)")
+    axL.set_ylabel("Per-step realized mean return")
+    axL.axhline(0.0, color="grey", lw=0.5, alpha=0.4)
+    axL.set_title(
+        "Efficient frontier & CML vs learned / classical policies\n"
+        "(cash-holding strategies lie on/inside the CML)",
+        fontsize=10,
+    )
+    axL.grid(True, alpha=0.25)
+    axL.legend(fontsize=7, loc="best")
+
+    # right: (MDD, AR) space with benchmarks
+    for model in FILM_MODELS:
+        pts = [(a, results.get((model["key"], a))) for a in ALPHAS]
+        pts = [(a, r) for a, r in pts if r]
+        if not pts:
+            continue
+        axR.plot(
+            [r["MDD"] for _, r in pts],
+            [r["AR"] for _, r in pts],
+            "-o",
+            color=model["color"],
+            ms=4,
+            lw=1.2,
+            label=model["label"],
+        )
+    marker_by_iset = {"causal": "D", "trained": "s", "oracle": "*"}
+    seen = set()
+    for key, r in bench.items():
+        if isinstance(key, str) and key.startswith("_"):
+            continue
+        if not isinstance(r, dict) or "MDD" not in r:
+            continue
+        iset = r["info_set"]
+        lbl = {
+            "causal": "classical (causal, fair)",
+            "trained": "classical (trained-once)",
+            "oracle": "classical (oracle ceiling)",
+        }[iset]
+        axR.scatter(
+            [r["MDD"]],
+            [r["AR"]],
+            marker=marker_by_iset[iset],
+            facecolor="none" if iset != "oracle" else "gold",
+            edgecolor="grey" if iset != "oracle" else "darkorange",
+            s=70,
+            zorder=4,
+            label=lbl if lbl not in seen else None,
+        )
+        seen.add(lbl)
+    for key in ("equal", "cash", "best"):
+        if key in results:
+            label, color, marker = BASELINE_STYLE[key]
+            r = results[key]
+            axR.scatter(
+                [r["MDD"]], [r["AR"]], color=color, s=130, marker=marker, zorder=5, label=label
+            )
+    axR.set_xlabel("Max drawdown (lower = safer)")
+    axR.set_ylabel("Accumulated return")
+    axR.axhline(0.0, color="grey", lw=0.5, alpha=0.4)
+    axR.set_title("Return vs drawdown: learned vs classical (by information set)", fontsize=10)
+    axR.grid(True, alpha=0.25)
+    axR.legend(fontsize=7, loc="best")
+
+    plt.tight_layout()
+    print("\nFigure (efficient-frontier / classical overlay):")
+    save_fig(fig, "comparison_mv_overlay.png")
+    plt.close(fig)
+
+
+def build_results_frame(results: dict, bench: dict) -> pd.DataFrame:
+    """
+    Assemble the numeric results table: every RL model x alpha, the classical
+    benchmarks grouped by information set, and the fixed baselines. Each row
+    carries an `Info set` column so the comparison footing is never ambiguous.
+
+    Args:
+        results (dict): RL + baseline results.
+        bench (dict): Classical benchmark records.
+
+    Returns:
+        pd.DataFrame: Tidy results table.
+    """
+    rows = []
+
+    def _row(model, alpha, iset, r):
+        rows.append(
+            {
+                "Model": model,
+                "alpha": alpha,
+                "Info set": iset,
+                "AR": r["AR"],
+                "MDD": r["MDD"],
+                "CVaR@5%": r["CVaR"],
+                "SR": r["SR"],
+                "Calmar": r.get("Calmar", float("nan")),
+            }
+        )
+
+    for alpha in ALPHAS:
+        for key, label in _model_rows():
+            r = results.get((key, alpha))
+            if r:
+                _row(label, f"{alpha:.0%}", "causal (RL)", r)
+    # classical benchmarks
+    for key, r in bench.items():
+        if isinstance(key, str) and key.startswith("_"):
+            continue
+        if not isinstance(r, dict) or "AR" not in r:
+            continue
+        alpha = f"{key[1]:.0%}" if isinstance(key, tuple) else "-"
+        _row(r["label"], alpha, r["info_set"], r)
+    # fixed baselines
+    for key in ("equal", "cash", "best"):
+        if key in results:
+            lbl = BASELINE_STYLE[key][0]
+            _row(lbl, "-", "fixed", results[key])
+
+    return pd.DataFrame(rows)
+
+
+def write_results_tables(frame: pd.DataFrame, stem: str = "results_table"):
+    """
+    Write the results table to CSV (raw metrics() values).
+
+    Args:
+        frame (pd.DataFrame): Table from build_results_frame.
+        stem (str): Output filename stem (in results/).
+    """
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    csv_path = os.path.join(OUTPUT_DIR, f"{stem}.csv")
+    frame.to_csv(csv_path, index=False)
+    print(f"  saved: {csv_path}")
+
+
+def write_protocol_table(bench: dict, stem: str = "eval_protocol"):
+    """
+    Write the disclosure legend: one row per competitor family stating its
+    information set, mu/Sigma estimator + window, objective + nu, and that costs
+    are paid. Every figure/table caption should reference this.
+
+    Args:
+        bench (dict): Benchmark records (for nu / presence checks).
+        stem (str): Output filename stem (in results/).
+    """
+    nu = _NU_CACHE.get("nu", float("nan"))
+    protocol = [
+        (
+            "T-dist FiLM (RL)",
+            "causal (trailing 15)",
+            "learned actor; state=15d window",
+            f"E[mu - (K(a,nu)-Kmin) sigma] + entropy; nu={nu:.2f}",
+            "yes",
+        ),
+        (
+            "Markowitz tangency/GMV (causal)",
+            "causal (trailing 15 & 60)",
+            "sample mu,Sigma + Ledoit-Wolf",
+            "max Sharpe / min variance (long-only)",
+            "yes",
+        ),
+        (
+            "t-CVaR@a (causal, fair)",
+            "causal (trailing 15)",
+            "sample mu,Sigma + Ledoit-Wolf",
+            f"max w'mu - (K(a,nu)-Kmin) sqrt(w'Sigma w); nu={nu:.2f}",
+            "yes",
+        ),
+        (
+            "Markowitz / t-CVaR (trained-once)",
+            "train period, fixed on test",
+            "mu,Sigma over 2010-2018",
+            "as above (static weights)",
+            "yes",
+        ),
+        (
+            "Markowitz / t-CVaR (ORACLE)",
+            "whole test (LOOK-AHEAD ceiling)",
+            "mu,Sigma over the test window",
+            "as above -- upper bound only",
+            "yes",
+        ),
+        (
+            "1/N, all-cash, best-asset",
+            "fixed / test-oracle (best)",
+            "none",
+            "constant weights",
+            "yes",
+        ),
+    ]
+    df = pd.DataFrame(
+        protocol,
+        columns=["Competitor", "Information set", "mu,Sigma estimator", "Objective", "Costs paid"],
+    )
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    csv_path = os.path.join(OUTPUT_DIR, f"{stem}.csv")
+    df.to_csv(csv_path, index=False)
+    print(f"  saved: {csv_path}")
+
+
 def main():
     print("Loading test data ...")
     df_test = pd.read_hdf(DATA_PATH, key="test", encoding="utf-8")
+    df_train = pd.read_hdf(DATA_PATH, key="train", encoding="utf-8")
 
     results: dict = {}
     evaluate_fixed_alpha_families(df_test, results)
@@ -910,12 +1474,35 @@ def main():
     dense_results: dict = {}
     evaluate_film_dense(df_test, dense_results)
 
+    # Classical benchmarks (Markowitz / parametric-t mean-CVaR) in every
+    # information set, scored through the same env.
+    bench: dict = {}
+    run_classical_benchmarks(df_test, df_train, bench)
+
     print_summary(results, best_idx)
     plot_value_curves(results)
     plot_frontier(results)
     plot_dense_frontier(results, dense_results)
     plot_metrics_vs_alpha(dense_results)
     plot_allocation_vs_alpha(dense_results)
+
+    # Efficient-frontier overlay + numeric result & disclosure tables.
+    plot_mv_overlay(results, bench)
+    write_results_tables(build_results_frame(results, bench))
+    write_protocol_table(bench)
+
+    from eval import interpret
+
+    interpret.run_all(
+        df_test=df_test,
+        film_models=FILM_MODELS,
+        dense_alphas=DENSE_ALPHAS,
+        find_checkpoint=find_checkpoint,
+        build_agent=build_agent,
+        make_test_env=make_test_env,
+        evaluate_policy=evaluate_policy,
+        save_fig=save_fig,
+    )
     print("\nDone.")
 
 
