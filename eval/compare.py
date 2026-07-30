@@ -1,24 +1,3 @@
-"""
-Combined model comparison on the held-out test split.
-
-It compares, on poloniex_fc.hf (key='test'), at alpha in {0.05, 0.15, 0.30, 0.50}:
-  1. T-dist fixed-alpha models: one checkpoint per alpha, each trained at its
-     own window (5, 10, 15, 10 for alpha 5/15/30/50%, matching the paper).
-     Evaluated at its own alpha only.
-
-  2. T-dist alpha-sensitive (FiLM) models: one checkpoint each, differing in
-     sigma_scale (25k, 20k, 15k). A single net is evaluated at ALL alphas,
-     tracing a risk-return frontier.
-
-  3. Paper's Normal-DDPG fixed-alpha models: one checkpoint per alpha.  The
-     architecture variant is dictated by each saved checkpoint: Type A (no alpha
-     input, no `out` layer) for alpha 5%, Type B (late-alpha injection, has an
-     `out` layer) for alpha 15/30/50%.  Evaluated at its own alpha.
-
-  4. Fixed-strategy baselines: 1/N, all-cash, and the best single
-     buy-and-hold asset (test-set oracle reference).
-"""
-
 from __future__ import annotations
 
 import os
