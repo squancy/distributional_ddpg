@@ -1,0 +1,7 @@
+Competitor,Information set,"mu,Sigma estimator",Objective,Costs paid
+T-dist FiLM (RL),causal (trailing 15),learned actor; state=15d window,"E[mu - (K(a,nu)-Kmin) sigma] + entropy; nu=9.52",yes
+Markowitz tangency/GMV (causal),causal (trailing 15 & 60),"sample mu,Sigma + Ledoit-Wolf",max Sharpe / min variance (long-only),yes
+"t-CVaR@a (causal, fair)",causal (trailing 15),"sample mu,Sigma + Ledoit-Wolf","max w'mu - (K(a,nu)-Kmin) sqrt(w'Sigma w); nu=9.52",yes
+Markowitz / t-CVaR (trained-once),"train period, fixed on test","mu,Sigma over 2010-2018",as above (static weights),yes
+Markowitz / t-CVaR (ORACLE),whole test (LOOK-AHEAD ceiling),"mu,Sigma over the test window",as above -- upper bound only,yes
+"1/N, all-cash, best-asset",fixed / test-oracle (best),none,constant weights,yes
